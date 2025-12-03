@@ -1,6 +1,8 @@
 # Design Principles for Data-Intensive Applications
 
-This document provides detailed design principles derived from "Designing Data-Intensive Applications" and distributed systems research.
+> Part of [Data-Intensive Systems Architect](SKILL.md) skill
+
+Detailed design principles derived from "Designing Data-Intensive Applications" and distributed systems research.
 
 ## Table of Contents
 
@@ -687,6 +689,289 @@ pipe.execute()
 - Overall throughput increases significantly
 - Partial failure handling more complex
 
+## Container-Era Distributed Patterns
+
+Based on "Designing Distributed Systems" by Brendan Burns (O'Reilly, 2nd Edition 2024).
+
+Containers and orchestrators provide building blocks for reusable distributed system patterns. These patterns transform distributed system development from bespoke solutions to composable, well-understood components.
+
+### Single-Node Patterns
+
+Patterns for multiple containers on a single machine, sharing resources like filesystem, network, and IPC.
+
+#### Sidecar Pattern
+
+**Purpose:** Augment application container with additional functionality without modifying the application.
+
+```
+┌─────────────────────────────────────┐
+│              Pod                     │
+│  ┌─────────────┐  ┌──────────────┐  │
+│  │ Application │  │   Sidecar    │  │
+│  │  Container  │◄─┤  Container   │  │
+│  │             │  │ (logs, proxy)│  │
+│  └─────────────┘  └──────────────┘  │
+│         Shared filesystem/network    │
+└─────────────────────────────────────┘
+```
+
+**Use cases:**
+- **HTTPS termination:** Add TLS to legacy HTTP service
+- **Log aggregation:** Collect and ship logs without app changes
+- **Configuration sync:** Dynamic config updates from external source
+- **Health monitoring:** Add health checks to legacy applications
+
+**Example:** Adding HTTPS to legacy service
+```yaml
+# Sidecar handles TLS, forwards to app on localhost
+containers:
+  - name: legacy-app
+    image: legacy-http-service
+    ports: [{containerPort: 8080}]
+  - name: tls-sidecar
+    image: nginx-ssl-proxy
+    ports: [{containerPort: 443}]
+```
+
+#### Ambassador Pattern
+
+**Purpose:** Proxy network connections on behalf of the application container.
+
+```
+┌─────────────────────────────────────┐
+│              Pod                     │
+│  ┌─────────────┐  ┌──────────────┐  │
+│  │ Application │──►│  Ambassador  │──►External
+│  │  Container  │  │   (proxy)    │   Services
+│  └─────────────┘  └──────────────┘  │
+└─────────────────────────────────────┘
+```
+
+**Use cases:**
+- **Service discovery:** Abstract away service location
+- **Circuit breaking:** Handle failures gracefully
+- **Rate limiting:** Protect downstream services
+- **Sharding proxy:** Route to correct shard transparently
+
+**Example:** Database sharding ambassador
+```python
+# Application connects to localhost:3306
+# Ambassador routes to correct shard based on key
+db.connect("localhost", 3306)
+db.query("SELECT * FROM users WHERE id = 123")
+# Ambassador: hash(123) → shard-2.db.cluster
+```
+
+#### Adapter Pattern
+
+**Purpose:** Standardize heterogeneous container interfaces for uniform access.
+
+```
+┌─────────────────────────────────────┐
+│              Pod                     │
+│  ┌─────────────┐  ┌──────────────┐  │
+│  │ Application │──►│   Adapter    │──►Monitoring
+│  │  (custom    │  │ (normalizes  │   System
+│  │   metrics)  │  │  to standard)│  │
+│  └─────────────┘  └──────────────┘  │
+└─────────────────────────────────────┘
+```
+
+**Use cases:**
+- **Metrics normalization:** Convert app-specific metrics to Prometheus format
+- **Log formatting:** Standardize log formats across services
+- **Protocol translation:** Bridge between different protocols
+
+### Multi-Node Serving Patterns
+
+Patterns for distributing load across multiple machines.
+
+#### Replicated Load-Balanced Services
+
+**Pattern:** Identical stateless replicas behind a load balancer.
+
+```
+                    ┌─────────────┐
+                    │Load Balancer│
+                    └──────┬──────┘
+           ┌───────────────┼───────────────┐
+           │               │               │
+      ┌────▼────┐     ┌────▼────┐     ┌────▼────┐
+      │Replica 1│     │Replica 2│     │Replica 3│
+      │(stateless)    │(stateless)    │(stateless)
+      └─────────┘     └─────────┘     └─────────┘
+```
+
+**Key properties:**
+- All replicas are identical and interchangeable
+- No session affinity required (stateless)
+- Horizontal scaling by adding replicas
+- Any replica can handle any request
+
+**Readiness probes:** Only route traffic to healthy replicas
+```yaml
+readinessProbe:
+  httpGet:
+    path: /health
+    port: 8080
+  initialDelaySeconds: 5
+  periodSeconds: 10
+```
+
+#### Sharded Services
+
+**Pattern:** Partition data/requests across replicas, each handling a subset.
+
+```
+                    ┌─────────────┐
+                    │Shard Router │
+                    └──────┬──────┘
+           ┌───────────────┼───────────────┐
+           │               │               │
+      ┌────▼────┐     ┌────▼────┐     ┌────▼────┐
+      │ Shard 0 │     │ Shard 1 │     │ Shard 2 │
+      │ (A-H)   │     │ (I-P)   │     │ (Q-Z)   │
+      └─────────┘     └─────────┘     └─────────┘
+```
+
+**Sharding functions:**
+- **Hash-based:** `shard = hash(key) % num_shards`
+- **Range-based:** Alphabetical or numeric ranges
+- **Lookup table:** Explicit mapping for flexibility
+
+**Hot sharding problem:**
+- Some shards receive disproportionate traffic
+- Solution: Replicate hot shards, use consistent hashing
+
+#### Scatter/Gather Pattern
+
+**Pattern:** Distribute request to all shards, aggregate responses.
+
+```
+Request ──► ┌─────────────┐
+            │   Scatter   │
+            └──────┬──────┘
+       ┌───────────┼───────────┐
+       │           │           │
+  ┌────▼────┐ ┌────▼────┐ ┌────▼────┐
+  │ Shard 0 │ │ Shard 1 │ │ Shard 2 │
+  └────┬────┘ └────┬────┘ └────┬────┘
+       │           │           │
+       └───────────┼───────────┘
+            ┌──────▼──────┐
+            │   Gather    │──► Response
+            └─────────────┘
+```
+
+**Use cases:**
+- Distributed search (query all shards, merge results)
+- Aggregation queries across partitions
+- Parallel processing with result combination
+
+**Considerations:**
+- Latency = slowest shard (tail latency matters)
+- Partial failures: Return partial results or fail entirely?
+- Timeout handling: Don't wait forever for slow shards
+
+### Batch Processing Patterns
+
+Patterns for processing large amounts of data.
+
+#### Work Queue Pattern
+
+**Pattern:** Distribute work items across worker pool.
+
+```
+┌─────────────┐     ┌─────────────┐     ┌─────────────┐
+│   Source    │────►│ Work Queue  │────►│   Workers   │
+│             │     │             │     │  (parallel) │
+└─────────────┘     └─────────────┘     └─────────────┘
+```
+
+**Key properties:**
+- Work items are independent
+- Workers pull items from queue
+- Automatic load balancing
+- Fault tolerance via requeue on failure
+
+#### Event-Driven Processing
+
+**Pattern:** React to events as they occur.
+
+```
+Events ──► ┌─────────────┐     ┌─────────────┐
+           │Event Stream │────►│  Processor  │──► Actions
+           │  (Kafka)    │     │  (stateless)│
+           └─────────────┘     └─────────────┘
+```
+
+**Patterns:**
+- **Copier:** Duplicate events to multiple destinations
+- **Filter:** Select events matching criteria
+- **Splitter:** Route events to different processors
+- **Sharder:** Partition events by key
+- **Merger:** Combine multiple streams
+
+### Failure Handling Patterns
+
+#### Thundering Herd Prevention
+
+**Problem:** All clients retry simultaneously after failure, overwhelming recovered service.
+
+**Solutions:**
+- **Exponential backoff with jitter:** Spread retries over time
+- **Circuit breaker:** Stop retrying when service is down
+- **Request coalescing:** Deduplicate identical requests
+
+```python
+def retry_with_jitter(func, max_retries=5):
+    for attempt in range(max_retries):
+        try:
+            return func()
+        except TransientError:
+            # Exponential backoff + random jitter
+            base_delay = 2 ** attempt
+            jitter = random.uniform(0, base_delay * 0.1)
+            time.sleep(base_delay + jitter)
+```
+
+#### Backlog Recovery
+
+**Problem:** After outage, backlog of requests causes prolonged degradation.
+
+**Solutions:**
+- **Request timeouts:** Abort stale requests
+- **Latency-based autoscaling:** Scale up to process backlog
+- **Request prioritization:** Newer requests over older ones (triage)
+
+#### The "Second System" Anti-Pattern
+
+**Problem:** Temptation to rewrite from scratch instead of incremental improvement.
+
+**Why it fails:**
+- New system never reaches feature parity
+- Old system continues accumulating features
+- Two systems to maintain indefinitely
+- Migration never completes
+
+**Better approach:**
+- Incremental refactoring
+- Strangler fig pattern (gradually replace components)
+- Feature flags for gradual rollout
+
+### Pattern Selection Guide
+
+| Scenario | Pattern | Rationale |
+|----------|---------|-----------|
+| Add functionality to legacy app | Sidecar | No code changes needed |
+| Abstract service discovery | Ambassador | Transparent to application |
+| Normalize heterogeneous metrics | Adapter | Standardize interfaces |
+| Stateless API scaling | Replicated LB | Simple horizontal scaling |
+| Large dataset partitioning | Sharded Services | Scale beyond single node |
+| Distributed search | Scatter/Gather | Query all partitions |
+| Background job processing | Work Queue | Parallel, fault-tolerant |
+| Real-time event processing | Event-Driven | React to changes |
+
 ## Summary
 
 These principles form the foundation for designing reliable, scalable, and maintainable data-intensive applications. The key is not to apply all principles rigidly, but to understand the trade-offs and choose appropriately for your context.
@@ -697,3 +982,8 @@ These principles form the foundation for designing reliable, scalable, and maint
 3. **Start simple, add complexity only when needed** (YAGNI - You Aren't Gonna Need It)
 4. **Make trade-offs explicit** (document why you chose A over B)
 5. **Plan for evolution** (systems change, make change easy)
+
+## References
+
+- **"Designing Data-Intensive Applications"** by Martin Kleppmann (O'Reilly, 2017)
+- **"Designing Distributed Systems"** by Brendan Burns (O'Reilly, 2nd Edition, 2024)

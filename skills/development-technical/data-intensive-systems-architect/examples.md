@@ -1,6 +1,8 @@
 # Real-World Architecture Examples
 
-This document provides practical examples of data-intensive system architectures, demonstrating how to apply DDIA principles to real-world scenarios.
+> Part of [Data-Intensive Systems Architect](SKILL.md) skill
+
+Practical examples of data-intensive system architectures demonstrating DDIA principles in real-world scenarios.
 
 ## Example 1: E-Commerce Platform
 

@@ -27,6 +27,10 @@ Skills for personal organization, planning, and efficiency.
 - [research-summarizer](./personal-productivity/research-summarizer/) - Summarize research materials
 - [note-taker](./personal-productivity/note-taker/) - Structure and organize notes
 
+### Business & Finance
+Skills for business operations, financial compliance, and tax planning.
+- [us-tax-compliance-foreign-entities](./business-finance/us-tax-compliance-foreign-entities/) - Expert guidance on C-Corp and LLC tax compliance for foreign owners
+
 ## Using These Skills
 
 1. Navigate to the skill folder you're interested in

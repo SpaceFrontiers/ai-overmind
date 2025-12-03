@@ -1,14 +1,22 @@
 ---
 name: data-intensive-systems-architect
-description: Guide for designing reliable, scalable, and maintainable data-intensive applications based on Martin Kleppmann's "Designing Data-Intensive Applications" and distributed systems best practices. Use when architecting systems that handle large-scale data storage, processing, replication, or distributed computing.
-version: 1.0.0
+description: Design reliable, scalable, maintainable data-intensive applications. Covers architecture patterns, storage engines (B-Trees, LSM-Trees), replication, partitioning, transactions, and concurrent programming. Use when architecting systems for large-scale data storage, processing, or distributed computing.
+version: 1.5.0
 author: AI Overmind
-tags: [architecture, distributed-systems, data-intensive, scalability, reliability, DDIA]
+tags: [architecture, distributed-systems, scalability, reliability, storage-engines, concurrency, consensus]
 ---
 
 # Data-Intensive Systems Architect
 
-This skill provides comprehensive guidance for designing data-intensive applications based on principles from Martin Kleppmann's "Designing Data-Intensive Applications" (DDIA) and modern distributed systems best practices.
+Comprehensive guidance for designing data-intensive applications. Based on authoritative sources: DDIA (Kleppmann), Database Internals (Petrov), Designing Distributed Systems (Burns), and concurrent programming research (Raynal, Taubenfeld).
+
+**Supporting Documents:**
+- [algorithms.md](algorithms.md) - Consensus, partitioning, probabilistic structures
+- [database-internals.md](database-internals.md) - Storage engine deep dive
+- [concurrency-primitives.md](concurrency-primitives.md) - Lock-free algorithms
+- [design-principles.md](design-principles.md) - Implementation patterns
+- [trade-offs.md](trade-offs.md) - Trade-off analysis framework
+- [examples.md](examples.md) - Real-world architectures
 
 ## Core Principles
 
@@ -98,6 +106,8 @@ Understand the underlying storage mechanism:
 - ✅ **Strengths:** Excellent write performance, efficient compression
 - ❌ **Weaknesses:** Slower reads, compaction overhead
 - **Use when:** Write-heavy workloads, append-only patterns
+
+> 💡 **Deep Dive Available:** For implementation-level details about B-Trees, LSM-Trees, page organization, WAL, MVCC, buffer management, and storage engine internals, see **[database-internals.md](database-internals.md)**
 
 ## Replication Strategies
 
@@ -203,6 +213,81 @@ Understand the underlying storage mechanism:
 - Eventual consistency
 
 **Use when:** Cross-service workflows in microservices
+
+## Concurrency Patterns and Synchronization 🔄
+
+### Progress Guarantees
+
+Modern concurrent systems provide different levels of progress guarantees:
+
+**Blocking (Traditional):**
+- May deadlock, requires detection/prevention
+- Simple to reason about and implement
+- **Use when:** Low contention, simplicity valued
+- **Examples:** PostgreSQL, MySQL InnoDB
+
+**Lock-Free (Modern):**
+- System-wide progress guaranteed (≥1 thread succeeds)
+- No deadlocks, better scalability
+- **Use when:** High contention, maximum throughput critical
+- **Examples:** Microsoft Hekaton Bw-Trees, RocksDB MemTable
+
+**Wait-Free (Specialized):**
+- Per-thread bounded progress
+- Strongest guarantee, highest complexity
+- **Use when:** Real-time requirements, bounded latency critical
+- **Examples:** Atomic counters (Fetch&Add)
+
+### Synchronization Primitive Selection
+
+Choose the right primitive for your use case:
+
+| Use Case | Recommended Primitive | Database Example |
+|----------|----------------------|------------------|
+| **Buffer pool latches** | Readers-writer lock or Lock-free | PostgreSQL LWLocks, Hekaton lock-free |
+| **Transaction coordination** | 2PL or MVCC+CAS | MySQL InnoDB, PostgreSQL MVCC |
+| **Index updates** | Latch coupling or Lock-free | B-Tree latch crabbing, Bw-Trees |
+| **Thread pools** | Semaphores or Lock-free queues | Connection pool, worker dispatch |
+| **Distributed consensus** | Raft or Multi-Paxos | CockroachDB, Google Spanner |
+| **Parallel queries** | Barrier synchronization | Map-Reduce, parallel aggregation |
+| **Counters** | Fetch&Add or Lock-free | Statistics, monitoring |
+
+### Lock-Based vs. Lock-Free Decision Matrix
+
+**Choose Lock-Based when:**
+- ✅ Simplicity preferred over maximum performance
+- ✅ Critical sections are short
+- ✅ Contention is low to moderate
+- ✅ Deadlock detection/avoidance is acceptable
+- ✅ Team has standard concurrency expertise
+
+**Choose Lock-Free when:**
+- ✅ Maximum throughput critical
+- ✅ High contention expected
+- ✅ Deadlock elimination required
+- ✅ Scalability to many cores essential
+- ✅ Team has advanced concurrency expertise
+
+**Trade-offs:**
+- **Lock-based:** Simple implementation, potential deadlocks, may not scale
+- **Lock-free:** Complex implementation, no deadlocks, scales better, requires garbage collection
+
+### Distributed Consensus
+
+**FLP Impossibility:** Pure asynchronous systems cannot guarantee consensus with failures
+
+**Practical Solutions:**
+- **Raft (CockroachDB, TiDB, etcd):** Leader-based, log replication, majority quorum
+- **Multi-Paxos (Spanner, Cosmos DB):** Proposer-acceptor-learner, two-phase protocol
+- **Leaderless (Cassandra):** Quorum reads/writes, eventual consistency, no consensus
+
+**When You Need Consensus:**
+- Distributed transaction commit (2PC, 3PC)
+- Leader election in replicated systems
+- Consistent snapshots across shards
+- Configuration management (ZooKeeper, etcd)
+
+> 💡 **Deep Dive Available:** For detailed concurrency algorithms, lock-free data structures, progress guarantees, and consensus protocols, see **[concurrency-primitives.md](concurrency-primitives.md)**
 
 ## Event-Driven Architecture 📩
 
@@ -366,25 +451,6 @@ Don't pick technologies first. Understand:
 - Focus team effort on business differentiators
 - Balance control vs operational simplicity
 
-## When to Use This Skill
-
-Apply these principles when:
-- Designing new data-intensive applications
-- Scaling existing systems beyond single-machine capacity
-- Evaluating technology choices for data storage/processing
-- Architecting distributed systems
-- Debugging performance or reliability issues
-- Planning capacity and growth
-- Conducting architecture reviews
-- Making build vs buy decisions for data infrastructure
-
-## Additional Resources
-
-For deeper exploration:
-- [design-principles.md](design-principles.md) - Detailed design principles and patterns
-- [trade-offs.md](trade-offs.md) - Comprehensive trade-off analysis framework
-- [examples.md](examples.md) - Real-world architecture examples and case studies
-
 ## Research Foundations
 
 This skill draws on established distributed systems research and academic literature:
@@ -416,12 +482,41 @@ Research on distributed consensus (Coan & Welch, 1992) demonstrates:
 ## References
 
 Based on principles from:
+
+### Books
 - **"Designing Data-Intensive Applications"** by Martin Kleppmann (O'Reilly, 2017)
+- **"Database Internals: A Deep Dive into How Distributed Data Systems Work"** by Alex Petrov (O'Reilly, 2019)
+- **"Designing Distributed Systems"** by Brendan Burns (O'Reilly, 2nd Edition, 2024)
+- **"Concurrent Programming: Algorithms, Principles, and Foundations"** by Michel Raynal (Springer, 2013)
+- **"Synchronization Algorithms and Concurrent Programming"** by Gadi Taubenfeld (Pearson, 2006)
+
+### Research Papers
+
+**Storage Engines:**
+- Mohan, C., et al. (1992). "ARIES: A Transaction Recovery Method Supporting Fine-Granularity Locking and Partial Rollbacks Using Write-Ahead Logging"
+- O'Neil, P., et al. (1996). "The Log-Structured Merge-Tree (LSM-Tree)"
+- Levandoski, J., Lomet, D., Sengupta, S. (2013). "The Bw-Tree: A B-tree for New Hardware Platforms"
+
+**Concurrency and Synchronization:**
+- Fischer, M., Lynch, N., Paterson, M. (1985). "Impossibility of Distributed Consensus with One Faulty Process" (FLP)
+- Herlihy, M. (1991). "Wait-Free Synchronization"
+- Herlihy, M. (1991). "Wait-Free Hierarchy"
+- Michael, M., Scott, M. (1996). "Simple, Fast, and Practical Non-Blocking and Blocking Concurrent Queue Algorithms"
+- Mellor-Crummey, J., Scott, M. (1991). "Algorithms for Scalable Synchronization on Shared-Memory Multiprocessors" (MCS Lock)
+- Dice, D., Shalev, O., Shavit, N. (2006). "Transactional Locking II" (TL2 STM)
+
+**Distributed Systems:**
 - Lindsay, D., Gill, S.S., Smirnova, D., & Garraghan, P. (2021). "The evolution of distributed computing systems: from fundamental to new frontiers". Computing, 103, 1859-1878.
 - Kalajdjieski, J., Raikwar, M., Arsov, N., Velinov, G., & Gligoroski, D. (2022). "Databases fit for blockchain technology: A complete overview". Blockchain: Research and Applications.
 - Coan, B.A., & Welch, J.L. (1992). "Distributed consensus revisited". Information Processing Letters.
+- Lamport, L. (1998). "The Part-Time Parliament" (Paxos)
+- Ongaro, D., Ousterhout, J. (2014). "In Search of an Understandable Consensus Algorithm" (Raft)
+- Attiya, H., Bar-Noy, A., Dolev, D. (1995). "Sharing Memory Robustly in Message-Passing Systems" (ABD Algorithm)
+
+### Industry Resources
 - AWS Well-Architected Framework - Reliability Pillar
-- Production experience from large-scale systems
+- Production experience from large-scale systems (Facebook/RocksDB, Google/LevelDB, Microsoft Hekaton, LinkedIn, Netflix, Uber, CockroachDB)
+- Computer Science Center Courses - Database Internals (Vadim Tsesko, Ilya Teterin), Parallel Programming (Evgeny Kalishenko)
 
 ## Key Takeaway
 

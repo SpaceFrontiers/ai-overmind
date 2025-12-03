@@ -1,6 +1,8 @@
 # Trade-Off Analysis Framework
 
-This document provides a comprehensive framework for analyzing trade-offs in data-intensive system design, based on "Designing Data-Intensive Applications" and distributed systems research.
+> Part of [Data-Intensive Systems Architect](SKILL.md) skill
+
+Comprehensive framework for analyzing trade-offs in data-intensive system design.
 
 ## Core Trade-Off Dimensions
 
@@ -730,6 +732,295 @@ Single-leader PostgreSQL with async read replicas
 - ✅ Read replicas for product browsing
 - ✅ Different consistency per use case
 
+## Advanced Topics
+
+### Conflict-Free Replicated Data Types (CRDTs)
+
+CRDTs enable optimistic replication where replicas proceed independently and always converge deterministically—replicas that receive the same updates have equivalent state, regardless of order.
+
+#### Two Main Approaches
+
+**Operation-based CRDTs (Op-based):**
+- Propagate commutative update operations between replicas
+- Require exactly-once delivery (reliable causal broadcast)
+- Lower bandwidth for small operations
+- More complex delivery requirements
+
+**State-based CRDTs (CvRDTs):**
+- Propagate entire state between replicas
+- Use merge functions (join-semilattice) to combine states
+- Idempotent—can send state multiple times
+- Higher bandwidth but simpler delivery
+
+#### Common CRDT Types
+
+| Type | Description | Use Case |
+|------|-------------|----------|
+| **G-Counter** | Grow-only counter | Likes, views, analytics |
+| **PN-Counter** | Positive-negative counter | Inventory (add/remove) |
+| **G-Set** | Grow-only set | Tags, followers |
+| **OR-Set** | Observed-remove set | Shopping cart items |
+| **LWW-Register** | Last-writer-wins register | User profile fields |
+| **MV-Register** | Multi-value register | Conflict-preserving edits |
+
+#### G-Counter Example
+
+```python
+class GCounter:
+    def __init__(self, node_id, num_nodes):
+        self.node_id = node_id
+        self.counts = [0] * num_nodes
+    
+    def increment(self):
+        self.counts[self.node_id] += 1
+    
+    def value(self):
+        return sum(self.counts)
+    
+    def merge(self, other):
+        # Take max of each position
+        for i in range(len(self.counts)):
+            self.counts[i] = max(self.counts[i], other.counts[i])
+```
+
+**Key insight:** Merge is commutative, associative, and idempotent—order doesn't matter.
+
+#### When to Use CRDTs
+
+| Scenario | CRDT Suitable? | Rationale |
+|----------|----------------|-----------|
+| Social media likes | ✅ Yes | Eventual accuracy acceptable |
+| Shopping cart | ✅ Yes | OR-Set handles add/remove |
+| Bank balance | ❌ No | Requires strong consistency |
+| Collaborative editing | ✅ Yes | Specialized text CRDTs |
+| Inventory count | ⚠️ Maybe | Risk of overselling |
+
+**Trade-off:** CRDTs sacrifice strong consistency for availability and partition tolerance. They guarantee convergence but not immediate consistency.
+
+### Observability: The Three Pillars
+
+Observability is the ability to understand system state from external outputs. Essential for debugging distributed systems.
+
+#### Metrics
+
+**Definition:** Numeric measurements aggregated over time.
+
+**Types:**
+- **Counters:** Monotonically increasing (requests, errors)
+- **Gauges:** Point-in-time values (CPU, memory, queue depth)
+- **Histograms:** Distribution of values (latency percentiles)
+
+**Best Practices:**
+```python
+# Good: Meaningful, actionable metrics
+request_latency_seconds = Histogram(
+    'request_latency_seconds',
+    'Request latency in seconds',
+    buckets=[0.01, 0.05, 0.1, 0.5, 1.0, 5.0]
+)
+
+error_count = Counter(
+    'http_errors_total',
+    'Total HTTP errors',
+    labels=['status_code', 'endpoint']
+)
+```
+
+**Key metrics to track:**
+- **RED:** Rate, Errors, Duration (for services)
+- **USE:** Utilization, Saturation, Errors (for resources)
+
+#### Logs
+
+**Definition:** Timestamped, immutable records of discrete events.
+
+**Structured logging:**
+```json
+{
+  "timestamp": "2024-01-15T10:30:00Z",
+  "level": "ERROR",
+  "service": "order-service",
+  "trace_id": "abc123",
+  "span_id": "def456",
+  "message": "Payment failed",
+  "user_id": "user-789",
+  "order_id": "order-012",
+  "error_code": "INSUFFICIENT_FUNDS"
+}
+```
+
+**Best Practices:**
+- Use structured (JSON) logging
+- Include correlation IDs (trace_id, span_id)
+- Log at appropriate levels (DEBUG, INFO, WARN, ERROR)
+- Avoid logging sensitive data (PII, credentials)
+
+#### Traces
+
+**Definition:** End-to-end request flow across services.
+
+**Components:**
+- **Trace:** Complete journey of a request
+- **Span:** Single operation within a trace
+- **Context propagation:** Passing trace IDs between services
+
+```
+Trace: user-request-abc123
+├── Span: api-gateway (50ms)
+│   ├── Span: auth-service (10ms)
+│   └── Span: order-service (35ms)
+│       ├── Span: inventory-check (8ms)
+│       ├── Span: payment-service (20ms)
+│       └── Span: notification-service (5ms)
+```
+
+**Key insight:** Traces reveal latency bottlenecks and failure points in distributed request flows.
+
+#### Observability Trade-offs
+
+| Aspect | Low Overhead | High Fidelity |
+|--------|--------------|---------------|
+| Sampling | Sample 1% of traces | Capture all traces |
+| Retention | 7 days | 90 days |
+| Cardinality | Few label values | Many label values |
+| Cost | Lower | Higher |
+
+### Time-Series Database Considerations
+
+Time-series data (metrics, IoT, financial) has unique characteristics requiring specialized storage.
+
+#### Characteristics of Time-Series Data
+
+- **Write-heavy:** Continuous ingestion, rare updates
+- **Time-ordered:** Natural ordering by timestamp
+- **Append-only:** Historical data rarely modified
+- **Query patterns:** Range queries, aggregations, downsampling
+
+#### Storage Optimizations
+
+**Compression techniques:**
+- **Delta encoding:** Store differences between consecutive values
+- **Run-length encoding:** Compress repeated values
+- **Gorilla compression:** Facebook's timestamp/value compression (10x)
+
+**Partitioning strategies:**
+```
+data/
+  year=2024/
+    month=01/
+      day=15/
+        hour=10/
+          data.parquet
+```
+
+**Time-based partitioning benefits:**
+- Efficient range queries
+- Easy data lifecycle management (TTL)
+- Parallel query execution
+
+#### TSDB vs RDBMS
+
+| Aspect | TSDB | RDBMS |
+|--------|------|-------|
+| Write throughput | Very high | Moderate |
+| Point updates | Poor | Good |
+| Range queries | Excellent | Good |
+| Joins | Limited | Excellent |
+| Compression | 10-20x | 2-3x |
+| Schema flexibility | High | Low |
+
+**Use TSDB when:**
+- Ingesting millions of data points/second
+- Queries are primarily time-range based
+- Data is append-only or rarely updated
+- Storage efficiency is critical
+
+### Saga Pattern: Choreography vs Orchestration
+
+Sagas manage distributed transactions across microservices without distributed locks.
+
+#### Choreography (Event-driven)
+
+Each service publishes events; other services react.
+
+```
+Order Service ──publish──► OrderCreated
+                              │
+              ┌───────────────┼───────────────┐
+              ▼               ▼               ▼
+         Inventory       Payment        Notification
+         Service         Service         Service
+              │               │               │
+              ▼               ▼               ▼
+        StockReserved   PaymentProcessed  EmailSent
+```
+
+**Pros:**
+- Loose coupling
+- No single point of failure
+- Services are independent
+
+**Cons:**
+- Hard to understand flow
+- Difficult to debug
+- Cyclic dependencies possible
+
+#### Orchestration (Central coordinator)
+
+Central orchestrator directs the saga.
+
+```
+                    ┌─────────────┐
+                    │ Orchestrator│
+                    └──────┬──────┘
+           ┌───────────────┼───────────────┐
+           ▼               ▼               ▼
+      Inventory       Payment        Notification
+      Service         Service         Service
+```
+
+**Pros:**
+- Clear flow visibility
+- Easier debugging
+- Centralized error handling
+
+**Cons:**
+- Single point of failure
+- Tighter coupling to orchestrator
+- Orchestrator can become complex
+
+#### Compensation Actions
+
+When a step fails, execute compensating transactions:
+
+```python
+class OrderSaga:
+    def execute(self, order):
+        try:
+            # Forward flow
+            inventory_id = self.reserve_inventory(order)
+            payment_id = self.process_payment(order)
+            self.send_notification(order)
+        except PaymentError:
+            # Compensation
+            self.release_inventory(inventory_id)
+            raise
+        except NotificationError:
+            # Payment succeeded, notification failed
+            # Log for manual retry, don't compensate payment
+            self.log_notification_failure(order)
+```
+
+#### Saga Selection Guide
+
+| Factor | Choreography | Orchestration |
+|--------|--------------|---------------|
+| Team structure | Multiple teams | Single team |
+| Complexity | Simple flows | Complex flows |
+| Debugging needs | Low | High |
+| Coupling tolerance | Low | Moderate |
+| Failure handling | Distributed | Centralized |
+
 ## Summary
 
 There are no universally correct choices, only appropriate trade-offs for your context. The key is to:
@@ -741,3 +1032,10 @@ There are no universally correct choices, only appropriate trade-offs for your c
 5. **Iterate** - Adjust as requirements evolve
 
 > "All engineering is about trade-offs. The mark of a good engineer is knowing which trade-offs to make."
+
+## References
+
+- Almeida, P.S. (2023). "Approaches to Conflict-free Replicated Data Types"
+- Albuquerque, C. & Correia, F.F. (2025). "Tracing and Metrics Design Patterns for Monitoring Cloud-native Applications"
+- Zhao, X. & Haller, P. (2020). "Replicated data types that unify eventual consistency and observable atomic consistency"
+- Research on Saga patterns in microservices architectures
