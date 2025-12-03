@@ -12,6 +12,16 @@ Low-level synchronization primitives, concurrent programming patterns, and lock-
 2. [Atomic Primitives and Hardware Support](#atomic-primitives-and-hardware-support)
 3. [Mutual Exclusion Algorithms](#mutual-exclusion-algorithms)
 4. [Lock-Free Data Structures](#lock-free-data-structures)
+    - [Core Challenges (ABA, Memory Reclamation)](#core-challenges-in-lock-free-programming)
+    - [Treiber Stack](#treiber-stack-lock-free-stack)
+    - [Michael-Scott Queue](#michael-scott-lock-free-queue)
+    - [Lock-Free Skip List](#lock-free-skip-list-memtable)
+    - [Bw-Trees](#bw-trees-lock-free-b-trees)
+    - [Split-Ordered Hash Table](#lock-free-hash-table-split-ordered-lists)
+    - [Read-Copy-Update (RCU)](#read-copy-update-rcu)
+    - [Safe Memory Reclamation](#safe-memory-reclamation-smr)
+    - [Harris Linked List](#lock-free-linked-list-harris-2001)
+    - [Wait-Free Structures](#wait-free-data-structures)
 5. [Synchronization Patterns](#synchronization-patterns)
 6. [Consensus and Impossibility Results](#consensus-and-impossibility-results)
 7. [Software Transactional Memory](#software-transactional-memory)
@@ -452,6 +462,112 @@ void write_unlock(struct rwlock *rw) {
 
 ## Lock-Free Data Structures
 
+Lock-free data structures guarantee system-wide progress without using locks. They are essential for high-performance concurrent systems where blocking is unacceptable.
+
+### Core Challenges in Lock-Free Programming
+
+**1. The ABA Problem:**
+```
+Thread 1: Read pointer A from location
+Thread 1: (preempted)
+Thread 2: Pop A, push B, push A (A is back but different!)
+Thread 1: CAS succeeds (sees A), but state is corrupted
+```
+
+**2. Memory Reclamation:**
+- Cannot free memory while other threads may access it
+- Requires safe memory reclamation (SMR) schemes
+- Major source of complexity in lock-free code
+
+**3. Memory Ordering:**
+- Compilers and CPUs reorder operations
+- Requires memory barriers/fences
+- Different architectures have different memory models
+
+---
+
+### Treiber Stack (Lock-Free Stack)
+
+**Simplest lock-free data structure** - Foundation for understanding lock-free techniques
+
+**Structure:**
+```c
+struct node {
+    void *data;
+    struct node *next;
+};
+
+struct treiber_stack {
+    atomic_ptr top;  // Points to top of stack
+};
+```
+
+**Push Operation:**
+```c
+void push(struct treiber_stack *stack, void *data) {
+    node *new_node = malloc(sizeof(node));
+    new_node->data = data;
+    
+    while (true) {
+        node *old_top = atomic_load(&stack->top);
+        new_node->next = old_top;
+        
+        // Atomically update top if unchanged
+        if (compare_and_swap(&stack->top, old_top, new_node)) {
+            return;  // Success
+        }
+        // CAS failed, retry with new top
+    }
+}
+```
+
+**Pop Operation:**
+```c
+void *pop(struct treiber_stack *stack) {
+    while (true) {
+        node *old_top = atomic_load(&stack->top);
+        
+        if (old_top == NULL) {
+            return NULL;  // Stack empty
+        }
+        
+        node *new_top = old_top->next;
+        void *data = old_top->data;
+        
+        if (compare_and_swap(&stack->top, old_top, new_top)) {
+            // DANGER: Cannot free old_top here (ABA problem!)
+            // Must use safe memory reclamation
+            retire(old_top);
+            return data;
+        }
+    }
+}
+```
+
+**ABA Problem in Treiber Stack:**
+```
+Initial: top → A → B → C
+
+Thread 1: pop() reads top=A, next=B
+Thread 1: (preempted before CAS)
+
+Thread 2: pop() succeeds, removes A
+Thread 2: pop() succeeds, removes B  
+Thread 2: push(A) - reuses node A!
+          top → A → C
+
+Thread 1: CAS(&top, A, B) succeeds! (A == A)
+          top → B → ??? (B was freed!)
+```
+
+**Solutions to ABA:**
+1. **Tagged pointers:** Include counter with pointer
+2. **Hazard pointers:** Protect nodes being accessed
+3. **Epoch-based reclamation:** Defer freeing until safe
+4. **LL/SC:** Hardware that detects any modification
+
+---
+
 ### Michael-Scott Lock-Free Queue
 
 **Most famous lock-free data structure** - Used in production systems worldwide
@@ -717,6 +833,540 @@ void consolidate_page(page_id pid) {
 - More complex than traditional B-Trees
 - Garbage collection required (epoch-based reclamation)
 - Delta chains add read overhead if too long
+
+---
+
+### Lock-Free Hash Table (Split-Ordered Lists)
+
+**Developed by:** Shalev and Shavit (2006)
+**Key Innovation:** Hash table that can resize without blocking
+
+**Problem with Traditional Hash Tables:**
+- Resizing requires moving elements
+- Moving elements requires locking entire table
+- Blocks all concurrent operations
+
+**Split-Ordered List Solution:**
+```
+Regular order:    0, 1, 2, 3, 4, 5, 6, 7
+Split order:      0, 4, 2, 6, 1, 5, 3, 7  (bit-reversal)
+
+Bucket 0 (size=2): 0 → 2 → 4 → 6 → ...
+Bucket 1 (size=2): 1 → 3 → 5 → 7 → ...
+
+After resize to size=4:
+Bucket 0: 0 → 4 → ...
+Bucket 1: 1 → 5 → ...
+Bucket 2: 2 → 6 → ...  (split from bucket 0)
+Bucket 3: 3 → 7 → ...  (split from bucket 1)
+```
+
+**Key Insight:** Elements never move! Only bucket pointers change.
+
+**Structure:**
+```c
+struct split_ordered_list {
+    atomic_ptr *buckets;      // Array of bucket pointers
+    atomic_int bucket_count;  // Current number of buckets
+    atomic_int item_count;    // Total items
+    lock_free_list list;      // Underlying sorted list
+};
+
+struct list_node {
+    uint64_t key;             // Split-ordered key
+    void *value;
+    atomic_ptr next;
+    bool is_sentinel;         // Bucket head marker
+};
+```
+
+**Insert Operation:**
+```c
+bool insert(split_ordered_list *ht, uint64_t key, void *value) {
+    uint64_t split_key = reverse_bits(key);
+    int bucket = key % atomic_load(&ht->bucket_count);
+    
+    // Ensure bucket is initialized
+    if (ht->buckets[bucket] == NULL) {
+        initialize_bucket(ht, bucket);
+    }
+    
+    // Insert into underlying list at correct position
+    list_node *start = ht->buckets[bucket];
+    bool success = list_insert(start, split_key, value);
+    
+    if (success) {
+        int count = atomic_fetch_add(&ht->item_count, 1);
+        // Check if resize needed
+        if (count / atomic_load(&ht->bucket_count) > LOAD_FACTOR) {
+            resize(ht);
+        }
+    }
+    return success;
+}
+```
+
+**Resize (Lock-Free!):**
+```c
+void resize(split_ordered_list *ht) {
+    int old_size = atomic_load(&ht->bucket_count);
+    int new_size = old_size * 2;
+    
+    // Just double the bucket count
+    // New buckets initialized lazily on first access
+    compare_and_swap(&ht->bucket_count, old_size, new_size);
+    
+    // No element movement needed!
+}
+```
+
+**Used by:** Java ConcurrentHashMap (inspired), Intel TBB
+
+---
+
+### Read-Copy-Update (RCU)
+
+**Developed by:** Paul McKenney (IBM), used extensively in Linux kernel
+**Key Insight:** Optimize for read-heavy workloads by making reads wait-free
+
+**Core Principles:**
+1. **Readers never block:** No locks, no atomic operations
+2. **Writers create new versions:** Copy-on-write semantics
+3. **Grace periods:** Wait for all readers to finish before freeing
+
+**RCU API:**
+```c
+// Reader side - extremely fast (no synchronization!)
+rcu_read_lock();      // Mark start of read-side critical section
+ptr = rcu_dereference(gptr);  // Safe pointer read
+// ... use ptr ...
+rcu_read_unlock();    // Mark end of critical section
+
+// Writer side
+new_data = kmalloc(...);
+*new_data = *old_data;        // Copy
+new_data->field = new_value;  // Update copy
+rcu_assign_pointer(gptr, new_data);  // Publish atomically
+synchronize_rcu();            // Wait for readers
+kfree(old_data);              // Safe to free
+```
+
+**How Grace Periods Work:**
+```
+Time →
+Thread 1: [---read old---]
+Thread 2:        [---read old---]
+Thread 3:                    [---read new---]
+Writer:   update ──────────────────────────── free old
+                  ←── grace period ──→
+                  (wait for threads 1,2)
+```
+
+**Implementation Sketch:**
+```c
+struct rcu_state {
+    atomic_int global_epoch;
+    atomic_int thread_epochs[MAX_THREADS];
+};
+
+void rcu_read_lock() {
+    int epoch = atomic_load(&rcu.global_epoch);
+    atomic_store(&rcu.thread_epochs[thread_id], epoch);
+    memory_barrier();
+}
+
+void rcu_read_unlock() {
+    atomic_store(&rcu.thread_epochs[thread_id], INACTIVE);
+}
+
+void synchronize_rcu() {
+    int start_epoch = atomic_fetch_add(&rcu.global_epoch, 1);
+    
+    // Wait for all threads to either:
+    // 1. Be inactive, or
+    // 2. Enter a new epoch
+    for (int t = 0; t < MAX_THREADS; t++) {
+        while (true) {
+            int thread_epoch = atomic_load(&rcu.thread_epochs[t]);
+            if (thread_epoch == INACTIVE || thread_epoch > start_epoch) {
+                break;
+            }
+            // Yield or spin
+        }
+    }
+}
+```
+
+**RCU vs. Reader-Writer Locks:**
+
+| Aspect | RCU | RW Locks |
+|--------|-----|----------|
+| Read overhead | Zero (no atomics) | Atomic increment/decrement |
+| Read scalability | Perfect | Limited by cache coherence |
+| Write overhead | Higher (copy + grace period) | Lower |
+| Memory usage | Higher (multiple versions) | Lower |
+| Best for | Read-mostly workloads | Balanced read/write |
+
+**Database Applications:**
+- **Route tables:** Read-heavy, infrequent updates
+- **Configuration data:** Read by every query
+- **Schema cache:** Rarely changes
+
+---
+
+### Safe Memory Reclamation (SMR)
+
+The fundamental challenge: When can we safely free memory in lock-free code?
+
+#### Hazard Pointers (Michael, 2004)
+
+**Idea:** Threads publish pointers they're currently accessing
+
+**Structure:**
+```c
+#define MAX_HAZARD_POINTERS 2  // Per thread
+
+struct hazard_pointer_record {
+    atomic_ptr hp[MAX_HAZARD_POINTERS];
+    struct hazard_pointer_record *next;
+};
+
+// Global list of all hazard pointer records
+atomic_ptr hp_list_head;
+
+// Per-thread retired list
+thread_local node *retired_list;
+thread_local int retired_count;
+```
+
+**Protecting a Pointer:**
+```c
+node *protect(atomic_ptr *src, int hp_index) {
+    node *ptr;
+    do {
+        ptr = atomic_load(src);
+        atomic_store(&my_hp_record->hp[hp_index], ptr);
+        memory_barrier();
+    } while (ptr != atomic_load(src));  // Validate
+    return ptr;
+}
+
+void release(int hp_index) {
+    atomic_store(&my_hp_record->hp[hp_index], NULL);
+}
+```
+
+**Retiring and Reclaiming:**
+```c
+void retire(node *ptr) {
+    // Add to thread-local retired list
+    ptr->next_retired = retired_list;
+    retired_list = ptr;
+    retired_count++;
+    
+    // Periodically scan and reclaim
+    if (retired_count >= THRESHOLD) {
+        scan_and_reclaim();
+    }
+}
+
+void scan_and_reclaim() {
+    // Collect all hazard pointers
+    set<void*> protected_ptrs;
+    for (hp_record *rec = hp_list_head; rec; rec = rec->next) {
+        for (int i = 0; i < MAX_HAZARD_POINTERS; i++) {
+            void *hp = atomic_load(&rec->hp[i]);
+            if (hp) protected_ptrs.insert(hp);
+        }
+    }
+    
+    // Free unprotected retired nodes
+    node **prev = &retired_list;
+    node *curr = retired_list;
+    while (curr) {
+        if (!protected_ptrs.contains(curr)) {
+            *prev = curr->next_retired;
+            free(curr);
+            retired_count--;
+        } else {
+            prev = &curr->next_retired;
+        }
+        curr = *prev;
+    }
+}
+```
+
+**Properties:**
+- **Bounded memory:** At most O(T² × H) unfreed nodes (T=threads, H=hazard pointers)
+- **Wait-free reads:** No blocking during protection
+- **Per-pointer overhead:** One atomic store per protected pointer
+
+#### Epoch-Based Reclamation (EBR)
+
+**Idea:** Track global epochs; free memory from old epochs
+
+**Structure:**
+```c
+struct epoch_state {
+    atomic_int global_epoch;
+    atomic_int thread_epochs[MAX_THREADS];
+    atomic_bool thread_active[MAX_THREADS];
+    
+    // Per-epoch retired lists
+    node *retired[3];  // 3 epochs
+};
+```
+
+**Operations:**
+```c
+void enter_critical_section() {
+    atomic_store(&epoch.thread_active[tid], true);
+    memory_barrier();
+    int e = atomic_load(&epoch.global_epoch);
+    atomic_store(&epoch.thread_epochs[tid], e);
+}
+
+void exit_critical_section() {
+    atomic_store(&epoch.thread_active[tid], false);
+}
+
+void retire(node *ptr) {
+    int e = atomic_load(&epoch.global_epoch);
+    // Add to current epoch's retired list
+    add_to_retired_list(ptr, e % 3);
+    
+    // Try to advance epoch
+    try_advance_epoch();
+}
+
+void try_advance_epoch() {
+    int current = atomic_load(&epoch.global_epoch);
+    
+    // Check if all threads have seen current epoch
+    for (int t = 0; t < MAX_THREADS; t++) {
+        if (atomic_load(&epoch.thread_active[t])) {
+            if (atomic_load(&epoch.thread_epochs[t]) != current) {
+                return;  // Thread in old epoch
+            }
+        }
+    }
+    
+    // Safe to advance
+    if (compare_and_swap(&epoch.global_epoch, current, current + 1)) {
+        // Free nodes from 2 epochs ago
+        free_retired_list((current + 1) % 3);
+    }
+}
+```
+
+**Properties:**
+- **Lower overhead than hazard pointers:** No per-access protection
+- **Unbounded memory:** Long-running reader blocks all reclamation
+- **Simpler implementation:** Fewer atomic operations
+
+#### Comparison of SMR Schemes
+
+| Scheme | Memory Bound | Read Overhead | Write Overhead | Robustness |
+|--------|--------------|---------------|----------------|------------|
+| Hazard Pointers | O(T² × H) | Medium | Low | High |
+| Epoch-Based | Unbounded | Very Low | Low | Low |
+| RCU | Unbounded | Zero | High | Medium |
+| Reference Counting | O(1) | High | High | High |
+| DEBRA | O(T × B) | Low | Low | High |
+
+**DEBRA (Distributed Epoch-Based Reclamation):**
+- Combines benefits of EBR with bounded memory
+- Used in modern lock-free data structures
+- Handles long-running operations gracefully
+
+---
+
+### Lock-Free Linked List (Harris, 2001)
+
+**Challenge:** Delete operation requires updating predecessor's next pointer
+
+**Key Innovation:** Mark nodes as logically deleted before physical removal
+
+**Structure:**
+```c
+struct node {
+    int key;
+    void *value;
+    atomic_marked_ptr next;  // Pointer + mark bit
+};
+```
+
+**Marked Pointer Encoding:**
+```c
+// Use lowest bit of pointer as mark (pointers are aligned)
+#define MARK(ptr)     ((node*)((uintptr_t)(ptr) | 1))
+#define UNMARK(ptr)   ((node*)((uintptr_t)(ptr) & ~1))
+#define IS_MARKED(ptr) ((uintptr_t)(ptr) & 1)
+```
+
+**Search with Physical Deletion:**
+```c
+bool find(list *l, int key, node **left, node **right) {
+retry:
+    node *left_next;
+    node *curr = l->head;
+    
+    while (true) {
+        node *next = atomic_load(&curr->next);
+        
+        // Skip marked (deleted) nodes
+        while (IS_MARKED(next)) {
+            // Try to physically remove
+            node *unmarked_next = UNMARK(next);
+            if (!compare_and_swap(&(*left)->next, curr, unmarked_next)) {
+                goto retry;  // Someone else modified, restart
+            }
+            curr = unmarked_next;
+            next = atomic_load(&curr->next);
+        }
+        
+        if (curr->key >= key) {
+            *right = curr;
+            return curr->key == key;
+        }
+        
+        *left = curr;
+        curr = next;
+    }
+}
+```
+
+**Delete Operation:**
+```c
+bool delete(list *l, int key) {
+    node *left, *right;
+    
+    while (true) {
+        if (!find(l, key, &left, &right)) {
+            return false;  // Not found
+        }
+        
+        node *right_next = atomic_load(&right->next);
+        if (IS_MARKED(right_next)) {
+            continue;  // Already deleted
+        }
+        
+        // Step 1: Logically delete (mark)
+        if (!compare_and_swap(&right->next, right_next, MARK(right_next))) {
+            continue;  // CAS failed, retry
+        }
+        
+        // Step 2: Physically delete
+        compare_and_swap(&left->next, right, UNMARK(right_next));
+        // If CAS fails, next find() will clean up
+        
+        return true;
+    }
+}
+```
+
+**Why Two-Step Deletion Works:**
+1. **Marking prevents insertion:** No new node can be inserted after marked node
+2. **Marked nodes are skipped:** Readers see consistent view
+3. **Physical deletion is optional:** Can be done lazily
+
+---
+
+### Wait-Free Data Structures
+
+**Stronger guarantee than lock-free:** Every operation completes in bounded steps
+
+#### Wait-Free Queue (Kogan-Petrank, 2011)
+
+**Key Technique:** Helping mechanism with operation descriptors
+
+**Structure:**
+```c
+struct operation {
+    enum { ENQUEUE, DEQUEUE } type;
+    void *value;
+    atomic_int phase;
+    atomic_bool pending;
+};
+
+struct wf_queue {
+    atomic_ptr head;
+    atomic_ptr tail;
+    operation *operations[MAX_THREADS];
+};
+```
+
+**Helping Mechanism:**
+```c
+void help_if_needed(wf_queue *q) {
+    // Check all threads for pending operations
+    for (int t = 0; t < MAX_THREADS; t++) {
+        operation *op = q->operations[t];
+        if (atomic_load(&op->pending)) {
+            help_operation(q, op);
+        }
+    }
+}
+
+void enqueue(wf_queue *q, void *value) {
+    operation *my_op = q->operations[thread_id];
+    my_op->type = ENQUEUE;
+    my_op->value = value;
+    atomic_store(&my_op->pending, true);
+    
+    // Help others first (ensures bounded time)
+    help_if_needed(q);
+    
+    // Complete my operation
+    while (atomic_load(&my_op->pending)) {
+        try_enqueue(q, my_op);
+    }
+}
+```
+
+**Trade-offs:**
+- **Pros:** Guaranteed bounded completion time
+- **Cons:** Higher overhead, more complex implementation
+- **Use when:** Real-time requirements, fairness critical
+
+#### Fetch-and-Add Counter (Wait-Free)
+
+**Simplest wait-free structure:**
+```c
+struct wf_counter {
+    atomic_int value;
+};
+
+int increment(wf_counter *c) {
+    return atomic_fetch_add(&c->value, 1);
+}
+
+int read(wf_counter *c) {
+    return atomic_load(&c->value);
+}
+```
+
+**Properties:**
+- Single instruction on x86 (`LOCK XADD`)
+- Bounded time (one atomic operation)
+- Used for: Statistics, sequence numbers, barriers
+
+---
+
+### Lock-Free vs. Wait-Free Selection Guide
+
+| Requirement | Lock-Free | Wait-Free |
+|-------------|-----------|-----------|
+| Maximum throughput | ✅ Better | ❌ Overhead |
+| Bounded latency | ❌ May starve | ✅ Guaranteed |
+| Implementation complexity | Medium | High |
+| Real-time systems | ❌ Unsuitable | ✅ Required |
+| General purpose | ✅ Recommended | ❌ Overkill |
+
+**Practical Advice:**
+1. **Start with lock-free:** Sufficient for most use cases
+2. **Use wait-free for:** Counters, real-time systems, fairness-critical paths
+3. **Hybrid approach:** Fast lock-free path, slow wait-free fallback
 
 ---
 
@@ -1359,9 +2009,18 @@ int abd_read() {
 - Herlihy (1991) "Wait-Free Hierarchy"
 
 **Lock-Free Data Structures:**
+- Treiber (1986) "Systems Programming: Coping with Parallelism" (Treiber Stack)
 - Michael, Scott (1996) "Simple, Fast, and Practical Non-Blocking and Blocking Concurrent Queue Algorithms"
 - Harris (2001) "A Pragmatic Implementation of Non-Blocking Linked-Lists"
+- Shalev, Shavit (2006) "Split-Ordered Lists: Lock-Free Extensible Hash Tables"
 - Levandoski, Lomet, Sengupta (2013) "The Bw-Tree: A B-tree for New Hardware Platforms"
+- Kogan, Petrank (2011) "Wait-Free Queues With Multiple Enqueuers and Dequeuers"
+
+**Memory Reclamation:**
+- Michael (2004) "Hazard Pointers: Safe Memory Reclamation for Lock-Free Objects"
+- Fraser (2004) "Practical Lock-Freedom" (Epoch-Based Reclamation)
+- McKenney, Slingwine (1998) "Read-Copy Update: Using Execution History to Solve Concurrency Problems"
+- Brown (2015) "Reclaiming Memory for Lock-Free Data Structures: There has to be a Better Way" (DEBRA)
 
 **Scalable Locking:**
 - Mellor-Crummey, Scott (1991) "Algorithms for Scalable Synchronization on Shared-Memory Multiprocessors"
@@ -1386,4 +2045,4 @@ int abd_read() {
 
 ---
 
-**Version:** 1.3.0 | **Updated:** December 2024
+**Version:** 1.4.0 | **Updated:** December 2024

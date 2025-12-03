@@ -20,6 +20,12 @@ Essential algorithms for building data-intensive distributed systems. Covers con
 10. [Quorum Systems](#quorum-systems)
 11. [Failure Detection](#failure-detection)
 12. [Anti-Entropy Synchronization](#anti-entropy-synchronization)
+    - [Read Repair](#read-repair)
+    - [Hinted Handoff](#hinted-handoff)
+    - [Active Anti-Entropy (Merkle Trees)](#active-anti-entropy-merkle-trees)
+    - [Gossip-Based Anti-Entropy](#gossip-based-anti-entropy)
+    - [Version Vectors and Conflict Detection](#version-vectors-and-conflict-detection)
+    - [Conflict-Free Replicated Data Types (CRDTs)](#conflict-free-replicated-data-types-crdts)
 
 ---
 
@@ -852,18 +858,113 @@ class VectorClock:
 
 ## Load Balancing Algorithms
 
-Distribute workload across multiple servers or resources.
+Distribute workload across multiple servers or resources. Load balancing is fundamental to building scalable, highly available systems.
+
+### Load Balancer Types by OSI Layer
+
+#### Layer 4 (L4) Load Balancing - Transport Layer
+
+**Operates at:** TCP/UDP level using IP addresses and port numbers.
+
+**Characteristics:**
+- Fast processing (no packet inspection)
+- Protocol-agnostic (works with any TCP/UDP application)
+- Performs Network Address Translation (NAT)
+- Cannot make content-based routing decisions
+
+**Use cases:**
+- High-throughput scenarios where content inspection not needed
+- Database connection pooling
+- Gaming servers, VoIP
+
+```
+Client ──► L4 Load Balancer ──► Server
+           (IP:Port routing)
+```
+
+#### Layer 7 (L7) Load Balancing - Application Layer
+
+**Operates at:** HTTP/HTTPS level, inspecting request content.
+
+**Characteristics:**
+- Content-based routing (URL, headers, cookies)
+- SSL/TLS termination
+- Request manipulation (header injection, URL rewriting)
+- Higher latency due to packet inspection
+
+**Use cases:**
+- Microservices routing by path/header
+- A/B testing, canary deployments
+- API gateway functionality
+- Session affinity via cookies
+
+```
+Client ──► L7 Load Balancer ──► Service A (/api/users)
+           (content routing)  ──► Service B (/api/orders)
+                              ──► Service C (/api/products)
+```
+
+#### Global Server Load Balancing (GSLB)
+
+**Operates at:** DNS level across multiple data centers/regions.
+
+**Characteristics:**
+- Geographic traffic distribution
+- Disaster recovery and failover
+- Latency-based routing (nearest data center)
+- Health monitoring across regions
+
+**Use cases:**
+- Multi-region deployments
+- CDN routing
+- Disaster recovery
+- Compliance (data residency requirements)
+
+```
+User (Europe) ──► DNS/GSLB ──► EU Data Center
+User (US)     ──► DNS/GSLB ──► US Data Center
+User (Asia)   ──► DNS/GSLB ──► Asia Data Center
+```
+
+### L4 vs L7 vs GSLB Comparison
+
+| Aspect | L4 | L7 | GSLB |
+|--------|----|----|------|
+| OSI Layer | Transport | Application | DNS |
+| Routing basis | IP, Port | Content, Headers | Geography, Health |
+| Performance | Fastest | Moderate | Varies |
+| SSL termination | No | Yes | No |
+| Content inspection | No | Yes | No |
+| Scope | Single site | Single site | Multi-site |
+
+---
 
 ### Static Algorithms
 
-**Round Robin (RR):**
-- Distribute requests sequentially to each server
-- Simple but ignores server capacity and current load
+Algorithms that don't consider real-time server state.
 
-**Weighted Round Robin (WRR):**
-- Assign weights based on server capacity
-- Higher weight = more requests
-- Requires prior knowledge of server capabilities
+#### Round Robin (RR)
+
+**Mechanism:** Distribute requests sequentially to each server in rotation.
+
+```python
+class RoundRobin:
+    def __init__(self, servers):
+        self.servers = servers
+        self.current = 0
+    
+    def next_server(self):
+        server = self.servers[self.current]
+        self.current = (self.current + 1) % len(self.servers)
+        return server
+```
+
+**Pros:** Simple, O(1), fair distribution for homogeneous servers
+**Cons:** Ignores server capacity and current load
+
+#### Weighted Round Robin (WRR)
+
+**Mechanism:** Assign weights based on server capacity; higher weight = more requests.
 
 ```python
 class WeightedRoundRobin:
@@ -886,22 +987,83 @@ class WeightedRoundRobin:
             
             if self.weights[self.current] >= self.current_weight:
                 return self.servers[self.current][0]
+    
+    def _gcd_list(self, numbers):
+        from math import gcd
+        from functools import reduce
+        return reduce(gcd, numbers)
 ```
+
+**Use case:** Heterogeneous server fleet with known capacities.
+
+#### IP Hash (Source Hash)
+
+**Mechanism:** Hash client IP to deterministically select server.
+
+```python
+class IPHash:
+    def __init__(self, servers):
+        self.servers = servers
+    
+    def get_server(self, client_ip):
+        hash_value = hash(client_ip)
+        return self.servers[hash_value % len(self.servers)]
+```
+
+**Pros:** Session affinity without cookies, deterministic
+**Cons:** Uneven distribution if IP distribution skewed, problematic with NAT
+
+#### URL Hash
+
+**Mechanism:** Hash request URL to route to consistent server (good for caching).
+
+```python
+class URLHash:
+    def __init__(self, servers):
+        self.servers = servers
+    
+    def get_server(self, url):
+        hash_value = hash(url)
+        return self.servers[hash_value % len(self.servers)]
+```
+
+**Use case:** Maximize cache hit rates by routing same URLs to same servers.
+
+---
 
 ### Dynamic Algorithms
 
-**Least Connections:**
-- Route to server with fewest active connections
-- Adapts to varying request durations
+Algorithms that adapt to real-time server state.
 
-**Weighted Least Connections (WLC):**
-- Combines connection count with server capacity
-- Score = connections / weight
-- Route to lowest score
+#### Least Connections
+
+**Mechanism:** Route to server with fewest active connections.
+
+```python
+class LeastConnections:
+    def __init__(self, servers):
+        self.connections = {server: 0 for server in servers}
+    
+    def next_server(self):
+        server = min(self.connections, key=self.connections.get)
+        self.connections[server] += 1
+        return server
+    
+    def release(self, server):
+        self.connections[server] -= 1
+```
+
+**Pros:** Adapts to varying request durations
+**Cons:** O(N) lookup, doesn't account for server capacity
+
+#### Weighted Least Connections (WLC)
+
+**Mechanism:** Combines connection count with server capacity.
 
 ```python
 class WeightedLeastConnections:
     def __init__(self, servers):
+        # servers = [("server1", 5), ("server2", 3), ("server3", 2)]
         self.servers = {name: {"weight": w, "connections": 0} 
                        for name, w in servers}
     
@@ -915,14 +1077,486 @@ class WeightedLeastConnections:
         self.servers[server]["connections"] -= 1
 ```
 
-### Comparison
+**Score formula:** `connections / weight` (lower is better)
 
-| Algorithm | Adapts to Load | Server Awareness | Complexity |
-|-----------|----------------|------------------|------------|
-| Round Robin | No | No | O(1) |
-| Weighted RR | No | Yes (static) | O(1) |
-| Least Connections | Yes | No | O(N) |
-| Weighted LC | Yes | Yes | O(N) |
+#### Least Response Time
+
+**Mechanism:** Route to server with lowest average response time + fewest connections.
+
+```python
+class LeastResponseTime:
+    def __init__(self, servers):
+        self.servers = {server: {
+            "connections": 0,
+            "avg_response_time": 0.0,
+            "request_count": 0
+        } for server in servers}
+    
+    def next_server(self):
+        def score(item):
+            name, stats = item
+            # Combine response time and connection count
+            return stats["avg_response_time"] * (stats["connections"] + 1)
+        
+        best = min(self.servers.items(), key=score)
+        best[1]["connections"] += 1
+        return best[0]
+    
+    def record_response(self, server, response_time):
+        stats = self.servers[server]
+        stats["connections"] -= 1
+        # Exponential moving average
+        alpha = 0.3
+        stats["avg_response_time"] = (
+            alpha * response_time + 
+            (1 - alpha) * stats["avg_response_time"]
+        )
+        stats["request_count"] += 1
+```
+
+**Use case:** Heterogeneous backends with varying performance characteristics.
+
+#### Resource-Based (Adaptive)
+
+**Mechanism:** Route based on real-time server resource metrics (CPU, memory, etc.).
+
+```python
+class ResourceBasedLoadBalancer:
+    def __init__(self, servers):
+        self.servers = {server: {
+            "cpu_load": 0.0,
+            "memory_used": 0.0,
+            "connections": 0
+        } for server in servers}
+    
+    def update_metrics(self, server, cpu_load, memory_used):
+        self.servers[server]["cpu_load"] = cpu_load
+        self.servers[server]["memory_used"] = memory_used
+    
+    def next_server(self):
+        def health_score(item):
+            name, metrics = item
+            # Lower score = healthier server
+            return (
+                metrics["cpu_load"] * 0.5 +
+                metrics["memory_used"] * 0.3 +
+                metrics["connections"] * 0.2
+            )
+        
+        best = min(self.servers.items(), key=health_score)
+        best[1]["connections"] += 1
+        return best[0]
+```
+
+**Requires:** Agent on each server reporting metrics to load balancer.
+
+---
+
+### Advanced Algorithms
+
+#### Power of Two Random Choices (P2C)
+
+**Mechanism:** Pick two random servers, choose the one with fewer connections.
+
+**Key insight:** Exponential improvement over pure random with minimal overhead.
+
+```python
+import random
+
+class PowerOfTwoChoices:
+    def __init__(self, servers):
+        self.servers = servers
+        self.connections = {server: 0 for server in servers}
+    
+    def next_server(self):
+        # Pick two random servers
+        if len(self.servers) < 2:
+            choice = self.servers[0]
+        else:
+            candidates = random.sample(self.servers, 2)
+            # Choose the one with fewer connections
+            choice = min(candidates, key=lambda s: self.connections[s])
+        
+        self.connections[choice] += 1
+        return choice
+    
+    def release(self, server):
+        self.connections[server] -= 1
+```
+
+**Mathematical property:**
+- Random allocation: max load = O(log N / log log N)
+- Power of Two Choices: max load = O(log log N) — exponential improvement!
+
+**When to use:**
+- Distributed load balancers (sidecars) without shared state
+- Service mesh architectures
+- When Least Connections is impractical
+
+**Trade-off:** Slightly worse than Least Connections but works in distributed settings without coordination.
+
+#### Consistent Hashing with Bounded Loads
+
+**Mechanism:** Consistent hashing + load limits to prevent hotspots.
+
+```python
+class BoundedLoadConsistentHash:
+    def __init__(self, servers, load_factor=1.25):
+        self.servers = servers
+        self.load_factor = load_factor
+        self.connections = {server: 0 for server in servers}
+        self.ring = self._build_ring()
+    
+    def _build_ring(self):
+        # Simplified: use consistent hashing ring
+        ring = {}
+        for i, server in enumerate(self.servers):
+            ring[hash(server) % 360] = server
+        return dict(sorted(ring.items()))
+    
+    def _max_load(self):
+        total = sum(self.connections.values())
+        avg = total / len(self.servers) if self.servers else 0
+        return max(1, int(avg * self.load_factor))
+    
+    def get_server(self, key):
+        hash_val = hash(key) % 360
+        max_load = self._max_load()
+        
+        # Find first server on ring that isn't overloaded
+        for ring_pos in sorted(self.ring.keys()):
+            if ring_pos >= hash_val:
+                server = self.ring[ring_pos]
+                if self.connections[server] < max_load:
+                    self.connections[server] += 1
+                    return server
+        
+        # Wrap around
+        for ring_pos in sorted(self.ring.keys()):
+            server = self.ring[ring_pos]
+            if self.connections[server] < max_load:
+                self.connections[server] += 1
+                return server
+        
+        # All overloaded, pick least loaded
+        return min(self.connections, key=self.connections.get)
+```
+
+**Use case:** Caching systems where you want cache locality but need to prevent hotspots.
+
+---
+
+### Session Affinity (Sticky Sessions)
+
+Ensure requests from the same client go to the same server.
+
+#### Affinity vs Persistence
+
+| Term | Layer | Mechanism | Accuracy |
+|------|-------|-----------|----------|
+| **Affinity** | L3/L4 | IP address | ~Approximate |
+| **Persistence** | L7 | Cookies, headers | 100% accurate |
+
+#### Implementation Methods
+
+**1. Source IP Affinity:**
+```python
+class SourceIPAffinity:
+    def __init__(self, servers):
+        self.servers = servers
+        self.mapping = {}  # IP -> server
+    
+    def get_server(self, client_ip):
+        if client_ip not in self.mapping:
+            # First request: use round-robin or other algorithm
+            self.mapping[client_ip] = self.servers[
+                hash(client_ip) % len(self.servers)
+            ]
+        return self.mapping[client_ip]
+```
+
+**Limitations:** NAT, mobile users changing IPs, proxy servers.
+
+**2. Cookie-Based Persistence:**
+```python
+class CookiePersistence:
+    def __init__(self, servers, cookie_name="SERVERID"):
+        self.servers = servers
+        self.cookie_name = cookie_name
+        self.current = 0
+    
+    def get_server(self, request_cookies):
+        # Check for existing session cookie
+        server_id = request_cookies.get(self.cookie_name)
+        if server_id and server_id in self.servers:
+            return server_id, None  # No new cookie needed
+        
+        # New session: assign server and create cookie
+        server = self.servers[self.current]
+        self.current = (self.current + 1) % len(self.servers)
+        return server, {self.cookie_name: server}
+```
+
+**3. Application Cookie Persistence:**
+- Use existing session cookie (e.g., JSESSIONID)
+- Load balancer learns server from Set-Cookie response
+- Routes future requests with that cookie to same server
+
+---
+
+### Health Checking
+
+Detect and remove unhealthy servers from the pool.
+
+#### Active Health Checks
+
+Load balancer proactively probes servers.
+
+```python
+import asyncio
+import aiohttp
+
+class ActiveHealthChecker:
+    def __init__(self, servers, check_interval=10, 
+                 healthy_threshold=2, unhealthy_threshold=3):
+        self.servers = {server: {
+            "healthy": True,
+            "consecutive_successes": 0,
+            "consecutive_failures": 0
+        } for server in servers}
+        self.check_interval = check_interval
+        self.healthy_threshold = healthy_threshold
+        self.unhealthy_threshold = unhealthy_threshold
+    
+    async def check_server(self, server):
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.get(
+                    f"http://{server}/health",
+                    timeout=aiohttp.ClientTimeout(total=5)
+                ) as response:
+                    return response.status == 200
+        except:
+            return False
+    
+    async def run_health_checks(self):
+        while True:
+            for server in self.servers:
+                is_healthy = await self.check_server(server)
+                stats = self.servers[server]
+                
+                if is_healthy:
+                    stats["consecutive_successes"] += 1
+                    stats["consecutive_failures"] = 0
+                    if stats["consecutive_successes"] >= self.healthy_threshold:
+                        stats["healthy"] = True
+                else:
+                    stats["consecutive_failures"] += 1
+                    stats["consecutive_successes"] = 0
+                    if stats["consecutive_failures"] >= self.unhealthy_threshold:
+                        stats["healthy"] = False
+            
+            await asyncio.sleep(self.check_interval)
+    
+    def get_healthy_servers(self):
+        return [s for s, stats in self.servers.items() if stats["healthy"]]
+```
+
+**Health check types:**
+- **TCP:** Connection succeeds
+- **HTTP:** GET /health returns 2xx
+- **gRPC:** Health checking protocol
+- **Custom:** Application-specific logic
+
+#### Passive Health Checks
+
+Monitor actual traffic for failures.
+
+```python
+class PassiveHealthChecker:
+    def __init__(self, servers, failure_threshold=5, 
+                 recovery_time=30, window_size=60):
+        self.servers = {server: {
+            "healthy": True,
+            "failures": [],  # timestamps of recent failures
+            "ejected_until": 0
+        } for server in servers}
+        self.failure_threshold = failure_threshold
+        self.recovery_time = recovery_time
+        self.window_size = window_size
+    
+    def record_failure(self, server):
+        import time
+        now = time.time()
+        stats = self.servers[server]
+        
+        # Add failure, remove old ones outside window
+        stats["failures"].append(now)
+        stats["failures"] = [
+            t for t in stats["failures"] 
+            if now - t < self.window_size
+        ]
+        
+        # Check if threshold exceeded
+        if len(stats["failures"]) >= self.failure_threshold:
+            stats["healthy"] = False
+            stats["ejected_until"] = now + self.recovery_time
+            stats["failures"] = []
+    
+    def record_success(self, server):
+        # Optionally clear some failures on success
+        pass
+    
+    def get_healthy_servers(self):
+        import time
+        now = time.time()
+        healthy = []
+        for server, stats in self.servers.items():
+            # Check if recovery time passed
+            if not stats["healthy"] and now > stats["ejected_until"]:
+                stats["healthy"] = True
+            if stats["healthy"]:
+                healthy.append(server)
+        return healthy
+```
+
+---
+
+### Load Balancer High Availability
+
+#### Active-Passive (Failover)
+
+```
+                    ┌─────────────────┐
+                    │  Virtual IP     │
+                    │  (Floating IP)  │
+                    └────────┬────────┘
+                             │
+              ┌──────────────┴──────────────┐
+              │                             │
+       ┌──────▼──────┐              ┌───────▼─────┐
+       │   Active    │◄─Heartbeat──►│   Passive   │
+       │     LB      │              │     LB      │
+       └──────┬──────┘              └─────────────┘
+              │                     (takes over on
+              │                      Active failure)
+    ┌─────────┼─────────┐
+    │         │         │
+┌───▼───┐ ┌───▼───┐ ┌───▼───┐
+│Server1│ │Server2│ │Server3│
+└───────┘ └───────┘ └───────┘
+```
+
+**Mechanism:** VRRP (Virtual Router Redundancy Protocol) or keepalived.
+
+#### Active-Active
+
+```
+                    ┌─────────────────┐
+                    │   DNS/Anycast   │
+                    └────────┬────────┘
+                             │
+              ┌──────────────┴──────────────┐
+              │                             │
+       ┌──────▼──────┐              ┌───────▼─────┐
+       │     LB 1    │              │     LB 2    │
+       │   (Active)  │              │   (Active)  │
+       └──────┬──────┘              └──────┬──────┘
+              │                            │
+              └────────────┬───────────────┘
+                           │
+              ┌────────────┼────────────┐
+              │            │            │
+          ┌───▼───┐    ┌───▼───┐    ┌───▼───┐
+          │Server1│    │Server2│    │Server3│
+          └───────┘    └───────┘    └───────┘
+```
+
+**Benefits:** Better resource utilization, higher throughput.
+**Challenge:** Session synchronization between load balancers.
+
+---
+
+### Distributed Load Balancing (Service Mesh)
+
+In service mesh architectures, each service has a sidecar proxy doing client-side load balancing.
+
+```
+┌─────────────────────┐     ┌─────────────────────┐
+│     Service A       │     │     Service B       │
+│  ┌───────────────┐  │     │  ┌───────────────┐  │
+│  │   App Code    │  │     │  │   App Code    │  │
+│  └───────┬───────┘  │     │  └───────────────┘  │
+│          │          │     │          ▲          │
+│  ┌───────▼───────┐  │     │  ┌───────┴───────┐  │
+│  │ Sidecar Proxy │──┼─────┼──► Sidecar Proxy │  │
+│  │  (Envoy/etc)  │  │     │  │  (Envoy/etc)  │  │
+│  └───────────────┘  │     │  └───────────────┘  │
+└─────────────────────┘     └─────────────────────┘
+```
+
+**Advantages:**
+- No single point of failure
+- Decentralized decision making
+- Service-specific load balancing policies
+
+**Challenges:**
+- No global view of server load
+- Power of Two Choices works well here
+- Need service discovery (Consul, etcd, Kubernetes)
+
+---
+
+### Algorithm Comparison
+
+| Algorithm | Adapts to Load | Server Awareness | Complexity | Best For |
+|-----------|----------------|------------------|------------|----------|
+| Round Robin | No | No | O(1) | Homogeneous servers |
+| Weighted RR | No | Yes (static) | O(1) | Known capacity differences |
+| IP Hash | No | No | O(1) | Session affinity (L4) |
+| Least Connections | Yes | No | O(N) or O(log N)* | Varying request durations |
+| Weighted LC | Yes | Yes | O(N) | Heterogeneous + varying load |
+| Least Response Time | Yes | Yes | O(N) | Latency-sensitive apps |
+| Power of Two | Yes | No | O(1) | Distributed/sidecar LBs |
+| Resource-Based | Yes | Yes | O(N) | Complex workloads |
+
+*O(log N) with binary tree implementation (HAProxy).
+
+### Algorithm Selection Guide
+
+```
+                        Start
+                          │
+                          ▼
+              ┌───────────────────────┐
+              │ Servers homogeneous?  │
+              └───────────┬───────────┘
+                    │           │
+                   Yes          No
+                    │           │
+                    ▼           ▼
+            ┌───────────┐  ┌───────────────┐
+            │Need sticky│  │Known capacity?│
+            │ sessions? │  └───────┬───────┘
+            └─────┬─────┘      │       │
+              │       │       Yes      No
+             Yes      No       │       │
+              │       │        ▼       ▼
+              ▼       ▼   Weighted  Least Conn
+          IP Hash  Round    RR     or Weighted LC
+                   Robin
+                          
+              ┌───────────────────────┐
+              │ Distributed LBs?      │
+              │ (sidecars/mesh)       │
+              └───────────┬───────────┘
+                    │           │
+                   Yes          No
+                    │           │
+                    ▼           ▼
+              Power of Two   Least Connections
+              Random Choices  (centralized)
+```
 
 ---
 
@@ -1098,32 +1732,186 @@ class PhiAccrualDetector:
 
 ## Anti-Entropy Synchronization
 
-Repair data inconsistencies between replicas.
+Anti-entropy protocols detect and repair data inconsistencies between replicas in distributed systems. The term originates from thermodynamics—entropy represents disorder (inconsistency), and anti-entropy mechanisms work to reduce it.
+
+### Core Concepts
+
+**Entropy Sources in Distributed Systems:**
+- Network partitions causing divergent writes
+- Node failures during replication
+- Message loss or reordering
+- Clock skew affecting version ordering
+- Concurrent updates to the same key
+
+**Anti-Entropy Approaches:**
+
+| Approach | Trigger | Scope | Latency Impact |
+|----------|---------|-------|----------------|
+| Read Repair | On read | Single key | Foreground |
+| Hinted Handoff | On write failure | Single key | Background |
+| Active Anti-Entropy | Periodic | Full dataset | Background |
+| Passive Anti-Entropy | On access | Accessed data | Foreground |
+
+---
 
 ### Read Repair
 
-Fix inconsistencies during read operations:
+Fix inconsistencies opportunistically during read operations.
 
 ```python
-def read_with_repair(key, replicas, quorum):
-    responses = []
-    for replica in replicas[:quorum]:
-        responses.append(replica.read(key))
+class ReadRepairCoordinator:
+    def read_with_repair(self, key, replicas, quorum):
+        responses = []
+        for replica in replicas[:quorum]:
+            responses.append(replica.read(key))
+        
+        # Find most recent version using version vector comparison
+        latest = self.resolve_versions(responses)
+        
+        # Repair stale replicas asynchronously
+        for i, response in enumerate(responses):
+            if self.is_stale(response, latest):
+                self.schedule_repair(replicas[i], key, latest)
+        
+        return latest.value
     
-    # Find most recent version
-    latest = max(responses, key=lambda x: x.version)
+    def resolve_versions(self, responses):
+        """Resolve using vector clocks or timestamps."""
+        valid = [r for r in responses if r is not None]
+        if not valid:
+            return None
+        
+        # Compare version vectors
+        latest = valid[0]
+        for response in valid[1:]:
+            cmp = self.compare_versions(response.version, latest.version)
+            if cmp > 0:  # response is newer
+                latest = response
+            elif cmp == 0:  # concurrent - need conflict resolution
+                latest = self.resolve_conflict(latest, response)
+        
+        return latest
     
-    # Repair stale replicas (async)
-    for i, response in enumerate(responses):
-        if response.version < latest.version:
-            replicas[i].write_async(key, latest.value, latest.version)
-    
-    return latest
+    def schedule_repair(self, replica, key, latest):
+        """Queue async repair to avoid blocking reads."""
+        self.repair_queue.put((replica, key, latest.value, latest.version))
 ```
+
+**Read Repair Variants:**
+- **Blocking Read Repair:** Wait for repair before returning (stronger consistency)
+- **Async Read Repair:** Return immediately, repair in background (lower latency)
+- **Probabilistic Read Repair:** Repair only a percentage of reads (reduced overhead)
+
+**Trade-offs:**
+- Pros: No additional background processes, repairs hot data
+- Cons: Increases read latency, cold data may remain inconsistent
+
+---
+
+### Hinted Handoff
+
+Temporarily store writes for unavailable nodes, replay when they recover.
+
+```python
+class HintedHandoffCoordinator:
+    def __init__(self, hint_window_hours=3):
+        self.hint_window = hint_window_hours * 3600
+        self.hints_store = HintsStore()
+    
+    def write(self, key, value, version, target_replicas):
+        successful = []
+        hints_created = []
+        
+        for replica in target_replicas:
+            if replica.is_available():
+                try:
+                    replica.write(key, value, version)
+                    successful.append(replica)
+                except WriteFailure:
+                    hint = self.create_hint(replica, key, value, version)
+                    hints_created.append(hint)
+            else:
+                # Node unavailable - create hint
+                hint = self.create_hint(replica, key, value, version)
+                hints_created.append(hint)
+        
+        # Store hints for later delivery
+        for hint in hints_created:
+            self.hints_store.save(hint)
+        
+        return len(successful) >= self.write_quorum
+    
+    def create_hint(self, target_replica, key, value, version):
+        return Hint(
+            id=uuid4(),
+            target_node_id=target_replica.id,
+            key=key,
+            value=value,
+            version=version,
+            timestamp=time.now(),
+            ttl=self.hint_window
+        )
+    
+    def replay_hints(self, recovered_node_id):
+        """Called when gossip detects node recovery."""
+        hints = self.hints_store.get_hints_for(recovered_node_id)
+        
+        for hint in hints:
+            if hint.is_expired():
+                self.hints_store.delete(hint)
+                continue
+            
+            try:
+                target = self.get_node(hint.target_node_id)
+                target.write(hint.key, hint.value, hint.version)
+                self.hints_store.delete(hint)
+            except WriteFailure:
+                # Node went down again, keep hint
+                pass
+```
+
+**Hint Storage Schema:**
+```sql
+CREATE TABLE hints (
+    hint_id         UUID PRIMARY KEY,
+    target_node_id  UUID NOT NULL,
+    key             BLOB NOT NULL,
+    value           BLOB NOT NULL,
+    version         BLOB NOT NULL,  -- Version vector or timestamp
+    created_at      TIMESTAMP NOT NULL,
+    ttl_seconds     INT NOT NULL,
+    INDEX (target_node_id, created_at)
+);
+```
+
+**Sloppy Quorum with Hinted Handoff:**
+
+In strict quorum, writes fail if W nodes are unavailable. Sloppy quorum allows writes to any N healthy nodes in the hash ring:
+
+```
+Strict Quorum (N=3, W=2):
+  Node A (down) ──X──► Write fails if only 1 of 3 available
+  Node B ────────────► 
+  Node C ────────────►
+
+Sloppy Quorum (N=3, W=2):
+  Node A (down) ──X──► Hint stored at Node D
+  Node B ────────────► Write succeeds
+  Node C ────────────► Write succeeds
+  Node D (backup) ───► Stores hint for Node A
+```
+
+**Hinted Handoff Limitations:**
+- Hints consume storage on backup nodes
+- Long outages exhaust hint window
+- Backup node failure loses hints
+- Read consistency not guaranteed during hint window
+
+---
 
 ### Active Anti-Entropy (Merkle Trees)
 
-Periodically compare and sync entire datasets:
+Periodically compare and synchronize entire datasets using hash trees.
 
 ```
 Replica A                    Replica B
@@ -1135,22 +1923,480 @@ Build Merkle Tree           Build Merkle Tree
               │
               ▼
          Roots Match?
-         ├── Yes: Done
-         └── No: Compare subtrees
+         ├── Yes: Done (O(1) comparison)
+         └── No: Compare subtrees recursively
                     │
                     ▼
-              Find differing leaves
+              Find differing leaves (O(log N) hashes)
                     │
                     ▼
-              Sync differing keys
+              Sync only differing keys
 ```
 
-**Advantages:**
-- Efficient: Only exchange O(log N) hashes to find differences
-- Complete: Catches all inconsistencies
-- Background: Doesn't impact foreground operations
+**Merkle Tree Anti-Entropy Implementation:**
 
-**Used by:** Riak, Cassandra, DynamoDB
+```python
+class MerkleAntiEntropy:
+    def __init__(self, data_store, tree_depth=10):
+        self.store = data_store
+        self.depth = tree_depth
+        self.tree = None
+        self.rebuild_interval = 3600  # 1 hour
+    
+    def build_tree(self):
+        """Build Merkle tree over key ranges."""
+        leaves = []
+        for key_range in self.partition_keyspace():
+            range_hash = self.hash_key_range(key_range)
+            leaves.append(range_hash)
+        
+        self.tree = self.build_from_leaves(leaves)
+        return self.tree
+    
+    def hash_key_range(self, key_range):
+        """Hash all key-value pairs in range."""
+        h = hashlib.sha256()
+        for key, value, version in self.store.scan(key_range):
+            h.update(key.encode())
+            h.update(value)
+            h.update(str(version).encode())
+        return h.digest()
+    
+    def compare_with_peer(self, peer):
+        """Find differing key ranges with peer."""
+        differences = []
+        self._compare_subtree(peer, 0, 0, differences)
+        return differences
+    
+    def _compare_subtree(self, peer, node_idx, depth, differences):
+        my_hash = self.tree.get_hash(node_idx)
+        peer_hash = peer.get_tree_hash(node_idx)
+        
+        if my_hash == peer_hash:
+            return  # Subtree matches
+        
+        if depth == self.depth:
+            # Leaf node - this key range differs
+            key_range = self.tree.get_key_range(node_idx)
+            differences.append(key_range)
+            return
+        
+        # Recurse into children
+        left_child = 2 * node_idx + 1
+        right_child = 2 * node_idx + 2
+        self._compare_subtree(peer, left_child, depth + 1, differences)
+        self._compare_subtree(peer, right_child, depth + 1, differences)
+    
+    def sync_differences(self, peer, differences):
+        """Synchronize differing key ranges."""
+        for key_range in differences:
+            my_data = list(self.store.scan(key_range))
+            peer_data = peer.scan(key_range)
+            
+            # Merge using version vectors
+            merged = self.merge_data(my_data, peer_data)
+            
+            # Apply merged data to both replicas
+            for key, value, version in merged:
+                self.store.write(key, value, version)
+                peer.write(key, value, version)
+```
+
+**Merkle Tree Optimizations:**
+- **Incremental Updates:** Update tree on writes instead of full rebuild
+- **Bloom Filter Pre-check:** Skip comparison if Bloom filters match
+- **Adaptive Depth:** Deeper trees for hot key ranges
+- **Streaming Comparison:** Compare while building to reduce memory
+
+**Cassandra Anti-Entropy (nodetool repair):**
+```bash
+# Full repair - compares all data
+nodetool repair keyspace_name
+
+# Incremental repair - only unrepaired data
+nodetool repair -inc keyspace_name
+
+# Parallel repair - multiple ranges simultaneously
+nodetool repair -pr keyspace_name
+```
+
+---
+
+### Gossip-Based Anti-Entropy
+
+Epidemic protocols for probabilistic consistency in large clusters.
+
+**Push, Pull, and Push-Pull Variants:**
+
+```python
+class GossipAntiEntropy:
+    def __init__(self, node_id, peers, fanout=3):
+        self.node_id = node_id
+        self.peers = peers
+        self.fanout = fanout  # Number of peers per round
+        self.state = {}       # key -> (value, version_vector)
+    
+    def gossip_round(self):
+        """Execute one gossip round."""
+        targets = random.sample(self.peers, min(self.fanout, len(self.peers)))
+        
+        for peer in targets:
+            # Push-Pull: exchange state bidirectionally
+            self.push_pull(peer)
+    
+    def push_pull(self, peer):
+        """Most efficient: exchange in both directions."""
+        # Send digest of local state
+        my_digest = self.create_digest()
+        peer_digest = peer.exchange_digest(my_digest)
+        
+        # Determine what to send and request
+        to_send = self.find_newer_local(peer_digest)
+        to_request = self.find_newer_remote(peer_digest)
+        
+        # Exchange actual data
+        peer_data = peer.exchange_data(to_send, to_request)
+        self.merge_data(peer_data)
+    
+    def create_digest(self):
+        """Create compact summary of local state."""
+        return {key: version for key, (_, version) in self.state.items()}
+    
+    def find_newer_local(self, peer_digest):
+        """Find keys where local version is newer."""
+        newer = []
+        for key, (value, version) in self.state.items():
+            peer_version = peer_digest.get(key)
+            if peer_version is None or version > peer_version:
+                newer.append((key, value, version))
+        return newer
+```
+
+**Convergence Analysis:**
+
+For N nodes with push-pull gossip:
+- Expected rounds to infect all nodes: O(log N)
+- Message complexity per round: O(N × fanout)
+- Total messages to convergence: O(N × fanout × log N)
+
+```
+Round 1: 1 node infected
+Round 2: ~fanout nodes infected  
+Round 3: ~fanout² nodes infected
+...
+Round log_fanout(N): All N nodes infected
+```
+
+**Scuttlebutt Protocol:**
+
+Efficient gossip that only transmits deltas:
+
+```python
+class ScuttlebuttNode:
+    def __init__(self, node_id):
+        self.node_id = node_id
+        self.state = {}  # key -> (value, version, source_node)
+        self.version_vector = defaultdict(int)  # node_id -> max_version
+    
+    def update(self, key, value):
+        """Local update."""
+        self.version_vector[self.node_id] += 1
+        version = self.version_vector[self.node_id]
+        self.state[key] = (value, version, self.node_id)
+    
+    def exchange(self, peer):
+        """Scuttlebutt exchange."""
+        # Send our version vector
+        peer_vv = peer.get_version_vector()
+        
+        # Find deltas: entries where we have newer versions
+        deltas = []
+        for key, (value, version, source) in self.state.items():
+            if version > peer_vv.get(source, 0):
+                deltas.append((key, value, version, source))
+        
+        # Send deltas, receive peer's deltas
+        peer_deltas = peer.receive_deltas(deltas, self.version_vector)
+        
+        # Merge peer's deltas
+        for key, value, version, source in peer_deltas:
+            if version > self.version_vector.get(source, 0):
+                self.state[key] = (value, version, source)
+                self.version_vector[source] = max(
+                    self.version_vector[source], version
+                )
+```
+
+---
+
+### Version Vectors and Conflict Detection
+
+Track causality to detect concurrent updates.
+
+```python
+class VersionVector:
+    def __init__(self, node_id):
+        self.node_id = node_id
+        self.vector = defaultdict(int)
+    
+    def increment(self):
+        """Increment on local write."""
+        self.vector[self.node_id] += 1
+        return dict(self.vector)
+    
+    def merge(self, other_vector):
+        """Merge on receiving update."""
+        for node, version in other_vector.items():
+            self.vector[node] = max(self.vector[node], version)
+    
+    @staticmethod
+    def compare(vv1, vv2):
+        """
+        Compare two version vectors.
+        Returns:
+          'before' if vv1 happened before vv2
+          'after' if vv1 happened after vv2
+          'concurrent' if neither dominates
+          'equal' if identical
+        """
+        all_keys = set(vv1.keys()) | set(vv2.keys())
+        
+        vv1_dominates = False
+        vv2_dominates = False
+        
+        for key in all_keys:
+            v1 = vv1.get(key, 0)
+            v2 = vv2.get(key, 0)
+            
+            if v1 > v2:
+                vv1_dominates = True
+            elif v2 > v1:
+                vv2_dominates = True
+        
+        if vv1_dominates and not vv2_dominates:
+            return 'after'
+        elif vv2_dominates and not vv1_dominates:
+            return 'before'
+        elif not vv1_dominates and not vv2_dominates:
+            return 'equal'
+        else:
+            return 'concurrent'
+```
+
+**Dotted Version Vectors (DVV):**
+
+Optimization for client-server systems to reduce vector size:
+
+```python
+class DottedVersionVector:
+    """
+    Compact version vector for systems where clients
+    don't maintain persistent identity.
+    
+    Structure: (dot, version_vector)
+    - dot: (node_id, counter) for the latest update
+    - version_vector: causal context
+    """
+    def __init__(self):
+        self.dot = None  # (node_id, counter)
+        self.vector = {}  # node_id -> counter
+    
+    def update(self, node_id, counter):
+        """Record new update."""
+        self.dot = (node_id, counter)
+    
+    def sync(self):
+        """Move dot into vector."""
+        if self.dot:
+            node_id, counter = self.dot
+            self.vector[node_id] = max(self.vector.get(node_id, 0), counter)
+            self.dot = None
+    
+    def descends(self, other):
+        """Check if self causally descends from other."""
+        # Check dot
+        if other.dot:
+            node_id, counter = other.dot
+            if self.vector.get(node_id, 0) < counter:
+                if self.dot != other.dot:
+                    return False
+        
+        # Check vector
+        for node_id, counter in other.vector.items():
+            if self.vector.get(node_id, 0) < counter:
+                return False
+        
+        return True
+```
+
+---
+
+### Conflict-Free Replicated Data Types (CRDTs)
+
+Data structures that automatically resolve conflicts through mathematical properties.
+
+**CRDT Properties:**
+- **Commutativity:** Order of operations doesn't matter
+- **Associativity:** Grouping of operations doesn't matter
+- **Idempotency:** Duplicate operations have no effect
+
+**State-Based CRDTs (CvRDTs):**
+
+```python
+class GCounter:
+    """Grow-only counter - state-based CRDT."""
+    
+    def __init__(self, node_id):
+        self.node_id = node_id
+        self.counts = defaultdict(int)
+    
+    def increment(self, amount=1):
+        self.counts[self.node_id] += amount
+    
+    def value(self):
+        return sum(self.counts.values())
+    
+    def merge(self, other):
+        """Merge by taking max of each node's count."""
+        for node_id, count in other.counts.items():
+            self.counts[node_id] = max(self.counts[node_id], count)
+
+
+class PNCounter:
+    """Positive-Negative counter - supports decrement."""
+    
+    def __init__(self, node_id):
+        self.p = GCounter(node_id)  # Increments
+        self.n = GCounter(node_id)  # Decrements
+    
+    def increment(self, amount=1):
+        self.p.increment(amount)
+    
+    def decrement(self, amount=1):
+        self.n.increment(amount)
+    
+    def value(self):
+        return self.p.value() - self.n.value()
+    
+    def merge(self, other):
+        self.p.merge(other.p)
+        self.n.merge(other.n)
+
+
+class LWWRegister:
+    """Last-Writer-Wins Register."""
+    
+    def __init__(self):
+        self.value = None
+        self.timestamp = 0
+    
+    def write(self, value, timestamp):
+        if timestamp > self.timestamp:
+            self.value = value
+            self.timestamp = timestamp
+    
+    def merge(self, other):
+        if other.timestamp > self.timestamp:
+            self.value = other.value
+            self.timestamp = other.timestamp
+
+
+class ORSet:
+    """Observed-Remove Set - add-wins semantics."""
+    
+    def __init__(self, node_id):
+        self.node_id = node_id
+        self.elements = {}  # element -> set of (node_id, counter) tags
+        self.counter = 0
+    
+    def add(self, element):
+        self.counter += 1
+        tag = (self.node_id, self.counter)
+        if element not in self.elements:
+            self.elements[element] = set()
+        self.elements[element].add(tag)
+    
+    def remove(self, element):
+        """Remove all observed tags for element."""
+        if element in self.elements:
+            self.elements[element] = set()
+    
+    def contains(self, element):
+        return element in self.elements and len(self.elements[element]) > 0
+    
+    def merge(self, other):
+        """Union of elements, union of tags."""
+        all_elements = set(self.elements.keys()) | set(other.elements.keys())
+        for element in all_elements:
+            my_tags = self.elements.get(element, set())
+            other_tags = other.elements.get(element, set())
+            self.elements[element] = my_tags | other_tags
+```
+
+**Operation-Based CRDTs (CmRDTs):**
+
+```python
+class OpBasedCounter:
+    """Operation-based counter - requires reliable causal broadcast."""
+    
+    def __init__(self):
+        self.value = 0
+    
+    def increment(self):
+        # Generate operation
+        op = ('increment', 1)
+        self.apply(op)
+        return op  # Broadcast to other replicas
+    
+    def apply(self, op):
+        """Apply operation - must be commutative."""
+        op_type, amount = op
+        if op_type == 'increment':
+            self.value += amount
+        elif op_type == 'decrement':
+            self.value -= amount
+```
+
+**CRDT Selection Guide:**
+
+| Use Case | CRDT Type | Conflict Resolution |
+|----------|-----------|---------------------|
+| Counters | G-Counter, PN-Counter | Sum of node counts |
+| Registers | LWW-Register, MV-Register | Timestamp or multi-value |
+| Sets | G-Set, 2P-Set, OR-Set | Add-wins or remove-wins |
+| Maps | OR-Map, LWW-Map | Per-key resolution |
+| Sequences | RGA, WOOT, LSEQ | Position-based ordering |
+
+---
+
+### Anti-Entropy Selection Guide
+
+| Scenario | Recommended Approach | Rationale |
+|----------|---------------------|-----------|
+| Hot data, read-heavy | Read Repair | Repairs most-accessed data |
+| Temporary failures | Hinted Handoff | Fast recovery, bounded storage |
+| Long-term consistency | Merkle Tree AAE | Complete, efficient comparison |
+| Large clusters | Gossip-based | Scalable, probabilistic |
+| Conflict-prone data | CRDTs | Automatic resolution |
+| Mixed workload | Layered approach | Combine multiple techniques |
+
+**Layered Anti-Entropy (Production Pattern):**
+
+```
+Layer 1: Read Repair (immediate, per-request)
+    ↓
+Layer 2: Hinted Handoff (short-term, per-failure)
+    ↓
+Layer 3: Active Anti-Entropy (periodic, full-scan)
+    ↓
+Layer 4: Manual Repair (on-demand, operator-triggered)
+```
+
+**Used by:**
+- **Amazon DynamoDB:** Merkle trees + hinted handoff + read repair
+- **Apache Cassandra:** All four layers
+- **Riak:** Merkle trees + read repair + CRDTs
+- **CockroachDB:** Raft-based replication + MVCC
 
 ---
 
@@ -1177,19 +2423,50 @@ Build Merkle Tree           Build Merkle Tree
 
 ## References
 
+### Consensus and Replication
 - Lamport, L. (1998). "The Part-Time Parliament" (Paxos)
 - Lamport, L. (2006). "Fast Paxos"
 - Ongaro, D., Ousterhout, J. (2014). "In Search of an Understandable Consensus Algorithm" (Raft)
+- Kemme, B., Jimenez-Peris, R., Patino-Martinez, M. (2010). "Database Replication" (Synthesis Lectures)
+
+### Partitioning and Hashing
 - Karger, D. et al. (1997). "Consistent Hashing and Random Trees"
+- Mirrokni, V. et al. (2018). "Consistent Hashing with Bounded Loads" (Google Research)
+
+### Probabilistic Data Structures
 - Bloom, B. (1970). "Space/Time Trade-offs in Hash Coding with Allowable Errors"
 - Flajolet, P. et al. (2007). "HyperLogLog: the analysis of a near-optimal cardinality estimation algorithm"
 - Merkle, R. (1987). "A Digital Signature Based on a Conventional Encryption Function"
+
+### Anti-Entropy and Epidemic Protocols
 - Demers, A. et al. (1987). "Epidemic Algorithms for Replicated Database Maintenance"
+- Özkasap, Ö. et al. (2010). "An analytical framework for self-organizing peer-to-peer anti-entropy algorithms" (Performance Evaluation)
+- DeCandia, G. et al. (2007). "Dynamo: Amazon's Highly Available Key-value Store" (SOSP)
+- Lakshman, A., Malik, P. (2010). "Cassandra: A Decentralized Structured Storage System" (LADIS)
+
+### CRDTs and Eventual Consistency
+- Shapiro, M. et al. (2011). "Conflict-free Replicated Data Types" (SSS)
+- Shapiro, M. et al. (2011). "A comprehensive study of Convergent and Commutative Replicated Data Types" (INRIA)
+- Karayel, E., Gonzàlez, E. (2022). "Strong eventual consistency of the collaborative editing framework WOOT" (Distributed Computing)
+- Viotti, P., Vukolić, M. (2016). "Consistency in Non-Transactional Distributed Storage Systems" (ACM Computing Surveys)
+- Almeida, P. et al. (2018). "Delta State Replicated Data Types" (Journal of Parallel and Distributed Computing)
+
+### Clocks and Ordering
 - Fidge, C. (1988). "Timestamps in Message-Passing Systems That Preserve the Partial Ordering"
+- Lamport, L. (1978). "Time, Clocks, and the Ordering of Events in a Distributed System"
+- Preguiça, N. et al. (2012). "Dotted Version Vectors: Logical Clocks for Optimistic Replication"
+
+### Failure Detection and Leader Election
 - Garcia-Molina, H. (1982). "Elections in a Distributed Computing System" (Bully Algorithm)
-- Bailis, P. et al. (2012). "Probabilistically Bounded Staleness for Practical Partial Quorums"
 - Hayashibara, N. et al. (2004). "The φ Accrual Failure Detector"
+
+### Quorums and Consistency
+- Bailis, P. et al. (2012). "Probabilistically Bounded Staleness for Practical Partial Quorums"
 - Jiménez-Peris, R. et al. (2003). "Are Quorums an Alternative for Data Replication?"
+
+### Load Balancing
+- Mitzenmacher, M. (1996). "The Power of Two Choices in Randomized Load Balancing" (PhD Thesis, Harvard)
+- Mitzenmacher, M., Richa, A., Sitaraman, R. (2001). "The Power of Two Random Choices: A Survey of Techniques and Results"
 
 ### Video Lectures
 
@@ -1198,4 +2475,4 @@ Build Merkle Tree           Build Merkle Tree
 - **Computer Science Seminar** - Raft Algorithm (Maxim Babenko)
 - **Lektorium** - Object Replication to Database Replication (Fernando Pedone)
 
-**Version:** 1.5.0 | **Updated:** December 2024
+**Version:** 1.7.0 | **Updated:** December 2024
