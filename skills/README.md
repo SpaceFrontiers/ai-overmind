@@ -14,6 +14,8 @@ Skills for software development, testing, and technical tasks.
 - [code-reviewer](./development-technical/code-reviewer/) - Review code for quality and best practices
 - [test-automation](./development-technical/test-automation/) - Generate automated tests for web applications
 - [api-documenter](./development-technical/api-documenter/) - Create comprehensive API documentation
+- [data-intensive-systems-architect](./development-technical/data-intensive-systems-architect/) - Design reliable, scalable data-intensive applications
+- [ai-rag-llm-engineer](./development-technical/ai-rag-llm-engineer/) - Build AI systems with LLMs, RAG, and semantic search
 
 ### Enterprise & Communication
 Skills for business communication, branding, and professional workflows.
